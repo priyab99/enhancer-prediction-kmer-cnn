@@ -1,0 +1,425 @@
+import numpy as np
+import torch
+from torch import nn
+from torch.autograd import Variable
+from torch.utils.data import Dataset, DataLoader
+import torch.nn.functional as F
+
+import pickle
+import time
+import math
+import os
+import csv
+import glob
+
+from sklearn import metrics
+from sklearn.model_selection import KFold  # or StratifiedKFold if desired
+
+############# HYPER-PARAMETERS ############
+FILE_MODEL_TMP = "model_tmp.pkl"
+
+MY_RANDOM_STATE = 5
+torch.manual_seed(MY_RANDOM_STATE)
+NUMBER_EPOCHS = 20
+
+LEARNING_RATE = 1e-4
+
+SAMPLE_LENGTH = 200
+AVGPOOL1D_KERNEL_SIZE = 4
+CONV1D_KERNEL_SIZE = 3
+
+# New branch parameters for each embedding:
+# We choose 8 filters in block1 and 16 filters in block2 so that:
+# output shape per branch = (16, floor(200/4)/4) = (16, 12) ==> 16*12 = 192 features per branch,
+# and 192*4 = 768 total features (same as original fc input).
+BRANCH_BLOCK1_OUT = 8
+BRANCH_BLOCK2_OUT = 16
+
+FULLY_CONNECTED_LAYER_SIZE = 256
+
+MODEL_DIR = '/content/drive/MyDrive/code_enhancers/new_modelone' + str(MY_RANDOM_STATE)
+if not os.path.exists(MODEL_DIR):
+    os.makedirs(MODEL_DIR)
+###########################################
+
+def kmer_to_index(kmer, k):
+    value = 0
+    for char in kmer:
+        if char == 'A':
+            val = 0
+        elif char == 'C':
+            val = 1
+        elif char == 'G':
+            val = 2
+        elif char == 'T':
+            val = 3
+        else:
+            raise ValueError(f"Invalid nucleotide '{char}' in k-mer {kmer}")
+        value = value * 4 + val
+    return value
+
+def load_text_file(file_text):
+    with open(file_text) as f:
+        lines = f.readlines()
+        my_data = [line.strip().upper() for line in lines[1::2]]
+        return my_data
+
+class EnhancerDataset(Dataset):
+    def __init__(self, X, Y):
+        self.X = X
+        self.Y = Y
+
+    def __getitem__(self, index):
+        label = self.Y[index]
+        sample = self.X[index]
+
+        # Pad with 'A' instead of 'N' to ensure valid k-mers
+        padded_sample = sample.ljust(SAMPLE_LENGTH + 3, 'A')  # Total length 203
+
+        k1_indices = []
+        k2_indices = []
+        k3_indices = []
+        k4_indices = []
+
+        for i in range(SAMPLE_LENGTH):
+            # Generate k-mer indices for each position
+            k1 = padded_sample[i]
+            k1_idx = kmer_to_index(k1, 1)
+            k1_indices.append(k1_idx)
+
+            k2 = padded_sample[i:i+2]
+            k2_idx = kmer_to_index(k2, 2)
+            k2_indices.append(k2_idx)
+
+            k3 = padded_sample[i:i+3]
+            k3_idx = kmer_to_index(k3, 3)
+            k3_indices.append(k3_idx)
+
+            k4 = padded_sample[i:i+4]
+            k4_idx = kmer_to_index(k4, 4)
+            k4_indices.append(k4_idx)
+
+        # Stack the k-mer indices as separate channels
+        input_tensor = torch.stack([
+            torch.LongTensor(k1_indices),
+            torch.LongTensor(k2_indices),
+            torch.LongTensor(k3_indices),
+            torch.LongTensor(k4_indices)
+        ], dim=0)
+
+        return input_tensor.long(), label  # Keep as Long tensor for embeddings
+
+    def __len__(self):
+        return len(self.X)
+
+# Define a convolutional branch for processing one embedding separately.
+class ConvBranch(nn.Module):
+    def __init__(self, in_channels, block1_out, block2_out):
+        super(ConvBranch, self).__init__()
+        self.block1 = nn.Sequential(
+            nn.Conv1d(in_channels, block1_out, kernel_size=CONV1D_KERNEL_SIZE, padding=1),
+            nn.BatchNorm1d(block1_out),
+            nn.ReLU(),
+            nn.Conv1d(block1_out, block1_out, kernel_size=CONV1D_KERNEL_SIZE, padding=1),
+            nn.BatchNorm1d(block1_out),
+            nn.ReLU(),
+            nn.MaxPool1d(AVGPOOL1D_KERNEL_SIZE)
+        )
+        self.block2 = nn.Sequential(
+            nn.Conv1d(block1_out, block2_out, kernel_size=CONV1D_KERNEL_SIZE, padding=1),
+            nn.BatchNorm1d(block2_out),
+            nn.ReLU(),
+            nn.Conv1d(block2_out, block2_out, kernel_size=CONV1D_KERNEL_SIZE, padding=1),
+            nn.BatchNorm1d(block2_out),
+            nn.ReLU(),
+            nn.MaxPool1d(AVGPOOL1D_KERNEL_SIZE)
+        )
+    def forward(self, x):
+        out = self.block1(x)
+        out = self.block2(out)
+        return out
+
+class EnhancerCnnModel(nn.Module):
+    def __init__(self):
+        super(EnhancerCnnModel, self).__init__()
+        # Embedding layers for each k-mer
+        self.embedding_k1 = nn.Embedding(4, 128)          # k=1 (4^1)
+        self.embedding_k2 = nn.Embedding(16, 128)         # k=2 (4^2)
+        self.embedding_k3 = nn.Embedding(64, 128)         # k=3 (4^3)
+        self.embedding_k4 = nn.Embedding(256, 128)        # k=4 (4^4)
+
+        # Define a separate convolutional branch for each embedding.
+        self.branch_k1 = ConvBranch(128, BRANCH_BLOCK1_OUT, BRANCH_BLOCK2_OUT)
+        self.branch_k2 = ConvBranch(128, BRANCH_BLOCK1_OUT, BRANCH_BLOCK2_OUT)
+        self.branch_k3 = ConvBranch(128, BRANCH_BLOCK1_OUT, BRANCH_BLOCK2_OUT)
+        self.branch_k4 = ConvBranch(128, BRANCH_BLOCK1_OUT, BRANCH_BLOCK2_OUT)
+
+        # After processing each branch:
+        # Each branch output: (batch_size, 16, L_out) where L_out = floor(floor(200/4)/4) = 12 (approximately)
+        # Total concatenated features = 16 * 12 * 4 = 768
+        self.fc = nn.Linear(768, FULLY_CONNECTED_LAYER_SIZE)
+        self.out = nn.Linear(FULLY_CONNECTED_LAYER_SIZE, 1)
+
+        self.criterion = nn.BCELoss()
+        self.optimizer = torch.optim.Adam(self.parameters(), lr=LEARNING_RATE)
+
+    def forward(self, inputs):
+        batch_size = inputs.size(0)
+        # Split input channels (each channel is a sequence of k-mer indices)
+        k1 = inputs[:, 0, :].long()
+        k2 = inputs[:, 1, :].long()
+        k3 = inputs[:, 2, :].long()
+        k4 = inputs[:, 3, :].long()
+
+        # Embed each input separately and permute to (batch, embedding_dim, seq_length)
+        emb1 = self.embedding_k1(k1).permute(0, 2, 1)
+        emb2 = self.embedding_k2(k2).permute(0, 2, 1)
+        emb3 = self.embedding_k3(k3).permute(0, 2, 1)
+        emb4 = self.embedding_k4(k4).permute(0, 2, 1)
+
+        # Process each embedding with its own convolutional branch
+        out1 = self.branch_k1(emb1)  # expected shape: (batch, 16, ~12)
+        out2 = self.branch_k2(emb2)
+        out3 = self.branch_k3(emb3)
+        out4 = self.branch_k4(emb4)
+
+        # Flatten each branch's output
+        out1 = out1.view(batch_size, -1)
+        out2 = out2.view(batch_size, -1)
+        out3 = out3.view(batch_size, -1)
+        out4 = out4.view(batch_size, -1)
+
+        # Concatenate the features from all branches
+        combined = torch.cat([out1, out2, out3, out4], dim=1)  # shape: (batch, 768)
+        fc_out = F.relu(self.fc(combined))
+        output = torch.sigmoid(self.out(fc_out))
+        return output
+
+#######################################
+# Training and Evaluation Functions
+#######################################
+
+def train_one_epoch(model, train_loader, learning_rate):
+    model.train()
+    # Update learning rate
+    for param_group in model.optimizer.param_groups:
+        param_group['lr'] = learning_rate
+
+    epoch_loss_train = 0.0
+    nb_train = 0
+    for i, data in enumerate(train_loader, 0):
+        inputs, labels = data
+        batch_size = inputs.size(0)
+        nb_train += batch_size
+
+        inputs = inputs.float()
+        labels = labels.float()
+
+        if torch.cuda.is_available():
+            inputs = inputs.cuda()
+            labels = labels.cuda()
+
+        model.optimizer.zero_grad()
+        outputs = model(inputs)
+        loss = model.criterion(outputs, labels)
+        loss.backward()
+        model.optimizer.step()
+
+        epoch_loss_train += loss.item() * batch_size
+
+    epoch_loss_train_avg = epoch_loss_train / nb_train
+    return epoch_loss_train_avg
+
+def evaluate(file_model, loader):
+    model = EnhancerCnnModel()
+    if torch.cuda.is_available():
+        model.cuda()
+    model.load_state_dict(torch.load(file_model))
+    model.eval()
+
+    epoch_loss = 0.0
+    nb_samples = 0
+
+    arr_labels = []
+    arr_prob = []
+
+    for i, data in enumerate(loader, 0):
+        inputs, labels = data
+        batch_size = inputs.size(0)
+        nb_samples += batch_size
+
+        arr_labels += labels.squeeze(1).data.cpu().numpy().tolist()
+
+        inputs = inputs.float()
+        labels = labels.float()
+
+        if torch.cuda.is_available():
+            inputs = inputs.cuda()
+            labels = labels.cuda()
+
+        outputs = model(inputs)
+        loss = model.criterion(outputs, labels)
+        epoch_loss += loss.item() * batch_size
+
+        arr_prob += outputs.squeeze(1).data.cpu().numpy().tolist()
+
+    epoch_loss_avg = epoch_loss / nb_samples
+    auc = metrics.roc_auc_score(arr_labels, arr_prob)
+    arr_labels_hyp = [int(prob > 0.5) for prob in arr_prob]
+    arr_labels = [int(label) for label in arr_labels]
+
+    acc, confusion_matrix, sensitivity, specificity, mcc = calculate_confusion_matrix(arr_labels, arr_labels_hyp)
+    result = {
+        'epoch_loss_avg': epoch_loss_avg,
+        'acc': acc,
+        'confusion_matrix': confusion_matrix,
+        'sensitivity': sensitivity,
+        'specificity': specificity,
+        'mcc': mcc,
+        'auc': auc,
+        'arr_prob': arr_prob,
+        'arr_labels': arr_labels,
+        'arr_labels_hyp': arr_labels_hyp
+    }
+    return result
+
+def calculate_confusion_matrix(arr_labels, arr_labels_hyp):
+    confusion_matrix = np.zeros((2, 2))
+    corrects = 0
+    for i in range(len(arr_labels)):
+        confusion_matrix[arr_labels_hyp[i]][arr_labels[i]] += 1
+        if arr_labels[i] == arr_labels_hyp[i]:
+            corrects += 1
+
+    acc = corrects / len(arr_labels)
+    specificity = (confusion_matrix[0][0] / (confusion_matrix[0][0] + confusion_matrix[1][0])
+                   if (confusion_matrix[0][0] + confusion_matrix[1][0]) != 0 else 0)
+    sensitivity = (confusion_matrix[1][1] / (confusion_matrix[0][1] + confusion_matrix[1][1])
+                   if (confusion_matrix[0][1] + confusion_matrix[1][1]) != 0 else 0)
+    tp = confusion_matrix[1][1]
+    tn = confusion_matrix[0][0]
+    fp = confusion_matrix[1][0]
+    fn = confusion_matrix[0][1]
+    mcc = (tp * tn - fp * fn) / math.sqrt((tp + fp)*(tp + fn)*(tn + fp)*(tn + fn)) if (tp + fp)*(tp + fn)*(tn + fp)*(tn + fn) != 0 else 0
+    return acc, confusion_matrix, sensitivity, specificity, mcc
+
+def train_one_fold(dataset, fold):
+    train_set = EnhancerDataset(dataset["data_train"], dataset["label_train"])
+    val_set = EnhancerDataset(dataset["data_val"], dataset["label_val"])
+
+    train_loader = DataLoader(dataset=train_set, batch_size=32,
+                              shuffle=True, num_workers=4)
+    val_loader = DataLoader(dataset=val_set, batch_size=32,
+                              shuffle=False, num_workers=4)
+
+    model = EnhancerCnnModel()
+    print("CNN Model:", model)
+    if torch.cuda.is_available():
+        model.cuda()
+
+    best_val_loss = float('inf')
+    best_epoch = 0
+
+    file_model = "best_model_saved.pkl"
+
+    train_loss = []
+    val_loss = []
+
+    for epoch in range(NUMBER_EPOCHS):
+        print("\n############### EPOCH :", epoch, "###############")
+        epoch_loss_train_avg = train_one_epoch(model, train_loader, LEARNING_RATE)
+        print("epoch_loss_train_avg:", epoch_loss_train_avg)
+
+        torch.save(model.state_dict(), os.path.join(MODEL_DIR, FILE_MODEL_TMP))
+        file_model_tmp = os.path.join(MODEL_DIR, FILE_MODEL_TMP)
+        result_val = evaluate(file_model_tmp, val_loader)
+
+        if best_val_loss > result_val['epoch_loss_avg']:
+            torch.save(model.state_dict(), os.path.join(MODEL_DIR, file_model))
+            best_val_loss = result_val['epoch_loss_avg']
+            print("Save model, best_val_loss:", best_val_loss)
+            best_epoch = epoch
+
+        train_loss.append(epoch_loss_train_avg)
+        val_loss.append(result_val['epoch_loss_avg'])
+
+    model.load_state_dict(torch.load(os.path.join(MODEL_DIR, file_model)))
+    model_fn = "enhancer_{}_{}.pkl".format(fold, best_epoch)
+    torch.save(model.state_dict(), os.path.join(MODEL_DIR, model_fn))
+
+    # Save training and validation loss logs
+    with open(os.path.join(MODEL_DIR, "logfile_loss_model_{}_{}.csv".format(fold, best_epoch)), mode='w') as lf_loss:
+        writer = csv.writer(lf_loss, delimiter=',')
+        writer.writerow(['epoch', 'train loss', 'validation loss'])
+        for i in range(len(train_loss)):
+            writer.writerow([i, train_loss[i], val_loss[i]])
+
+    print("\n####### EVALUATE ON VALIDATION")
+    print("best_epoch:", best_epoch)
+    print("\n ==> VALIDATION RESULT: ")
+    file_model_full = os.path.join(MODEL_DIR, model_fn)
+    result_val = evaluate(file_model_full, val_loader)
+    print("Validation AUC:", result_val['auc'])
+
+def check_dataset(dataset):
+    print("\n==> Checking dataset")
+    # Check data_train
+    data_train = dataset["data_train"]
+    nb_error_samples = sum(1 for sample in data_train if len(sample) != SAMPLE_LENGTH)
+    if nb_error_samples > 0:
+        print("data_train error:", nb_error_samples)
+    else:
+        print("data_train: OK!")
+
+    # Check data_val
+    data_val = dataset["data_val"]
+    nb_error_samples = sum(1 for sample in data_val if len(sample) != SAMPLE_LENGTH)
+    if nb_error_samples > 0:
+        print("data_val error:", nb_error_samples)
+    else:
+        print("data_val: OK!")
+
+def train_kfold():
+    print("\n==> Loading train set")
+    data_strong = load_text_file('/content/drive/MyDrive/code_enhancers/Train/data_strong_enhancers.txt')
+    print("data_strong:", len(data_strong))
+    data_weak = load_text_file('/content/drive/MyDrive/code_enhancers/Train/data_week_enhancers.txt')
+    print("data_weak:", len(data_weak))
+
+    data_enhancers = data_strong + data_weak
+    print("data_enhancers:", len(data_enhancers))
+    data_non_enhancers = load_text_file('/content/drive/MyDrive/code_enhancers/Train/data_non_enhancers.txt')
+    print("data_non_enhancers:", len(data_non_enhancers))
+
+    label_enhancers = np.ones((len(data_enhancers), 1))
+    label_non_enhancers = np.zeros((len(data_non_enhancers), 1))
+
+    data = np.concatenate((data_enhancers, data_non_enhancers))
+    label = np.concatenate((label_enhancers, label_non_enhancers))
+
+    kf = KFold(n_splits=5, shuffle=True, random_state=MY_RANDOM_STATE)
+    # Alternatively, use StratifiedKFold if desired:
+    # from sklearn.model_selection import StratifiedKFold
+    # kf = StratifiedKFold(n_splits=5, shuffle=True, random_state=MY_RANDOM_STATE)
+
+    fold = 0
+    for train_index, val_index in kf.split(data, label):
+        data_train, data_val = data[train_index], data[val_index]
+        label_train, label_val = label[train_index], label[val_index]
+
+        dataset = {
+            "data_train": data_train,
+            "label_train": label_train,
+            "data_val": data_val,
+            "label_val": label_val
+        }
+
+        # Optional: check the dataset integrity
+        check_dataset(dataset)
+        train_one_fold(dataset, fold)
+        fold += 1
+
+##################################
+if __name__ == "__main__":
+    traininglog_fn = os.path.join(MODEL_DIR, "training_log.csv")
+    train_kfold()
